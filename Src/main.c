@@ -78,7 +78,7 @@ void LCD_diag(uint8_t stage, uint8_t data);
 // ожидания. Значение видно в окне переменных отладчика
 volatile uint8_t i2c_stage = 0;
 // Вариант завершения приёма: 0 – А, 1 – Б (см. ниже)
-volatile uint8_t i2c_mode = 0;
+volatile uint8_t i2c_mode = 1;
 
 //=============================================================
 // ОСНОВНАЯ ПРОГРАММА
@@ -102,8 +102,9 @@ int main(void)
     // чтение байта из регистра BMP180_CHIP_ID устройства
     // с адресом BMP180_ADDR
     id = I2C_ReadByte(BMP180_ADDR, BMP180_CHIP_ID);
-    if (id != 0x55) {         // повтор по варианту Б
-        i2c_mode = 1;
+    if (id != 0x55) {         // повтор по второму варианту
+        i2c_mode = (uint8_t)(i2c_mode ? 0 : 1);
+        delay_ms(5);          // пауза на освобождение шины
         id = I2C_ReadByte(BMP180_ADDR, BMP180_CHIP_ID);
     }
     // отображение результата на дисплее
@@ -302,8 +303,12 @@ uint8_t I2C_ReadByte(uint8_t dev_addr, uint8_t reg)
     return data;
 
 error:
-    I2C3->CR1 |= I2C_CR1_STOP;  // освобождение шины
     i2c_stage |= 0x80;          // признак сбоя на шаге
+    I2C3->CR1 |= I2C_CR1_STOP;  // освобождение шины
+    // даём условию STOP выйти на шину до сброса модуля,
+    // иначе линии останутся захваченными
+    timeout = I2C_TIMEOUT;
+    while ((I2C3->CR1 & I2C_CR1_STOP) && --timeout) {};
     I2C3_Init();   // сброс модуля: снимает признак BUSY
     return 0xFF;                // код ошибки
 }
@@ -360,8 +365,12 @@ uint8_t I2C_WriteByte(uint8_t dev_addr, uint8_t reg,
     return 0;               // успех
 
 error:
-    I2C3->CR1 |= I2C_CR1_STOP;  // освобождение шины
     i2c_stage |= 0x80;          // признак сбоя на шаге
+    I2C3->CR1 |= I2C_CR1_STOP;  // освобождение шины
+    // даём условию STOP выйти на шину до сброса модуля,
+    // иначе линии останутся захваченными
+    timeout = I2C_TIMEOUT;
+    while ((I2C3->CR1 & I2C_CR1_STOP) && --timeout) {};
     I2C3_Init();   // сброс модуля: снимает признак BUSY
     return 0xFF;                // код ошибки
 }
