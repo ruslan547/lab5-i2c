@@ -77,6 +77,8 @@ void LCD_diag(uint8_t stage, uint8_t data);
 // устанавливается, если на этом шаге истекло время
 // ожидания. Значение видно в окне переменных отладчика
 volatile uint8_t i2c_stage = 0;
+// Вариант завершения приёма: 0 – А, 1 – Б (см. ниже)
+volatile uint8_t i2c_mode = 0;
 
 //=============================================================
 // ОСНОВНАЯ ПРОГРАММА
@@ -100,9 +102,14 @@ int main(void)
     // чтение байта из регистра BMP180_CHIP_ID устройства
     // с адресом BMP180_ADDR
     id = I2C_ReadByte(BMP180_ADDR, BMP180_CHIP_ID);
+    if (id != 0x55) {         // повтор по варианту Б
+        i2c_mode = 1;
+        id = I2C_ReadByte(BMP180_ADDR, BMP180_CHIP_ID);
+    }
     // отображение результата на дисплее
     if (id == 0x55)
-        LCD_send_string("BMP180 OK!      ");
+        LCD_send_string(i2c_mode ? "BMP180 OK! (B)  "
+                                 : "BMP180 OK! (A)  ");
     else
         LCD_diag(i2c_stage, id);  // шаг сбоя и принятый байт
 
@@ -257,20 +264,34 @@ uint8_t I2C_ReadByte(uint8_t dev_addr, uint8_t reg)
     while (!(I2C3->SR1 & I2C_SR1_ADDR) && --timeout) {};
     if (!timeout) goto error;
 
-    // 4. Приём одного байта. Порядок действий задан
-    // документацией: ACK сбрасывается до снятия ADDR,
-    // а STOP формируется до чтения DR – иначе ведомый
-    // успеет начать передачу второго байта
-    I2C3->CR1 &= ~I2C_CR1_ACK;   // ответом будет NACK
-    (void)I2C3->SR1;             // сброс флага ADDR:
-    (void)I2C3->SR2;             // чтение SR1, затем SR2
-    I2C3->CR1 |= I2C_CR1_STOP;   // условие STOP
+    // 4. Приём одного байта. Применяется один из двух
+    // допустимых порядков завершения обмена
+    if (i2c_mode == 0) {
+        // А: по документации – ACK снимается до снятия
+        // ADDR, условие STOP выдаётся до чтения DR
+        I2C3->CR1 &= ~I2C_CR1_ACK;
+        (void)I2C3->SR1;         // сброс флага ADDR:
+        (void)I2C3->SR2;         // чтение SR1, затем SR2
+        I2C3->CR1 |= I2C_CR1_STOP;
+    }
+    else {
+        // Б: приём при установленном бите ACK, снятие
+        // ACK и STOP – после появления принятого байта
+        I2C3->CR1 |= I2C_CR1_ACK;
+        (void)I2C3->SR1;
+        (void)I2C3->SR2;
+    }
 
     timeout = I2C_TIMEOUT;
     i2c_stage = 0x07;
     // ждём, пока в DR появится принятый байт
-    while (!(I2C3->SR1 & I2C_SR1_RXNE) && --timeout) {};
+    while (!(I2C3->SR1 & (I2C_SR1_RXNE | I2C_SR1_BTF))
+           && --timeout) {};
     if (!timeout) goto error;
+    if (i2c_mode != 0) {
+        I2C3->CR1 &= ~I2C_CR1_ACK;
+        I2C3->CR1 |= I2C_CR1_STOP;
+    }
     data = I2C3->DR;        // чтение байта сбрасывает RXNE
 
     timeout = I2C_TIMEOUT;
@@ -283,6 +304,7 @@ uint8_t I2C_ReadByte(uint8_t dev_addr, uint8_t reg)
 error:
     I2C3->CR1 |= I2C_CR1_STOP;  // освобождение шины
     i2c_stage |= 0x80;          // признак сбоя на шаге
+    I2C3_Init();   // сброс модуля: снимает признак BUSY
     return 0xFF;                // код ошибки
 }
 
@@ -340,5 +362,6 @@ uint8_t I2C_WriteByte(uint8_t dev_addr, uint8_t reg,
 error:
     I2C3->CR1 |= I2C_CR1_STOP;  // освобождение шины
     i2c_stage |= 0x80;          // признак сбоя на шаге
+    I2C3_Init();   // сброс модуля: снимает признак BUSY
     return 0xFF;                // код ошибки
 }
