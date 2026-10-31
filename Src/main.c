@@ -33,14 +33,15 @@
 #define BMP180_MEAS_CTRL  0xF4
 // таймаут ожидания флагов, циклов
 #define I2C_TIMEOUT       10000UL
-// тактовая частота шины APB1, Гц
-#define F_PCLK1           42000000UL
+// тактовая частота шины APB1, Гц – определяется в clock.c
+// (42 МГц при работе от PLL, 16 МГц при работе от HSI)
+#define F_PCLK1           PCLK1_Hz
 // частота шины I2C, Гц – по варианту 200 кГц
 #define F_SCL             200000UL
 // скважность: 0 – 2:1; 1 – 16:9
 #define DUTY              0
 
-// Расчёт ccr и trise на этапе компиляции
+// Расчёт ccr и trise по фактической частоте шины APB1
 #if F_SCL > 100000UL        // Fast mode: 100...400 кГц
     #if DUTY == 0
         // T_low/T_high = 2:1 => T_scl = 3*CCR*T_pclk1 =>
@@ -153,7 +154,7 @@ void I2C3_Init(void)
     // 5. Запись частотных параметров
     // частота тактирования модуля в МГц
     I2C3->CR2 &= ~I2C_CR2_FREQ;                  // очистка
-    I2C3->CR2 |=  (uint16_t)(F_PCLK1/1000000UL); // 42 МГц
+    I2C3->CR2 |=  (uint16_t)(F_PCLK1/1000000UL); // частота, МГц
 
     if (F_SCL > 100000UL) {              // Fast mode
         if (DUTY == 0)                   // 200 кГц; 2:1
