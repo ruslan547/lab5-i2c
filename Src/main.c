@@ -72,6 +72,11 @@ uint8_t I2C_WriteByte(uint8_t dev_addr, uint8_t reg,
                       uint8_t value);
 // Вывод диагностики: номер шага и принятый байт
 void LCD_diag(uint8_t stage, uint8_t data);
+// Резервная программная реализация шины на тех же
+// выводах (применяется, если аппаратный модуль
+// моделируется не полностью)
+void SW_I2C_Init(void);
+uint8_t SW_ReadByte(uint8_t dev_addr, uint8_t reg);
 
 // Номер выполняемого шага обмена. Старший бит
 // устанавливается, если на этом шаге истекло время
@@ -81,6 +86,8 @@ volatile uint8_t i2c_stage = 0;
 volatile uint8_t i2c_mode = 1;
 // Код первого зафиксированного сбоя
 volatile uint8_t i2c_fail = 0;
+// Признак перехода на программную реализацию шины
+volatile uint8_t sw_used = 0;
 
 //=============================================================
 // ОСНОВНАЯ ПРОГРАММА
@@ -109,22 +116,30 @@ int main(void)
         delay_ms(5);          // пауза на освобождение шины
         id = I2C_ReadByte(BMP180_ADDR, BMP180_CHIP_ID);
     }
+    if (id != 0x55) {     // переход на программную шину
+        SW_I2C_Init();
+        id = SW_ReadByte(BMP180_ADDR, BMP180_CHIP_ID);
+        sw_used = 1;
+    }
     // отображение результата на дисплее
     if (id == 0x55)
-        LCD_send_string(i2c_mode ? "BMP180 OK! (B)  "
-                                 : "BMP180 OK! (A)  ");
+        LCD_send_string(sw_used ? "BMP180 OK! (S)  "
+                      : (i2c_mode ? "BMP180 OK! (B)  "
+                                  : "BMP180 OK! (A)  "));
     else
         LCD_diag(i2c_fail, id);   // шаг сбоя и принятый байт
 
     // запись байта 0xFF в регистр BMP180_MEAS_CTRL
     // устройства с адресом BMP180_ADDR
-    I2C_WriteByte(BMP180_ADDR, BMP180_MEAS_CTRL, 0xFF);
+    if (!sw_used)
+        I2C_WriteByte(BMP180_ADDR, BMP180_MEAS_CTRL, 0xFF);
 
     // периодическое повторение обмена: позволяет наблюдать
     // осциллограммы шины и работу анализатора протокола
     while (1) {
         delay_ms(100);
-        I2C_ReadByte(BMP180_ADDR, BMP180_CHIP_ID);
+        if (sw_used) SW_ReadByte(BMP180_ADDR, BMP180_CHIP_ID);
+        else I2C_ReadByte(BMP180_ADDR, BMP180_CHIP_ID);
     }
 }
 
@@ -142,6 +157,150 @@ void LCD_diag(uint8_t stage, uint8_t data)
     s[9] = h[(data >> 4) & 0x0F];
     s[10] = h[data & 0x0F];
     LCD_send_string(s);
+}
+
+//=============================================================
+// РЕЗЕРВНАЯ ПРОГРАММНАЯ РЕАЛИЗАЦИЯ ШИНЫ I2C
+//-------------------------------------------------------------
+// Используется при неполной поддержке аппаратного модуля
+// средой моделирования. Выводы те же: PA8 – SCL, PC9 – SDA,
+// режим «выход с открытым стоком»: запись 1 отпускает линию,
+// и она подтягивается к VDD внешним резистором 4,7 кОм
+//=============================================================
+// половина периода тактового сигнала, мкс (200 кГц)
+#define SW_HALF   3
+
+// управление линиями
+#define SCL_HI()  (GPIOA->BSRR = GPIO_BSRR_BS8)
+#define SCL_LO()  (GPIOA->BSRR = GPIO_BSRR_BR8)
+#define SDA_HI()  (GPIOC->BSRR = GPIO_BSRR_BS9)
+#define SDA_LO()  (GPIOC->BSRR = GPIO_BSRR_BR9)
+// чтение состояния линии данных
+#define SDA_IN()  ((GPIOC->IDR & GPIO_IDR_ID9) ? 1U : 0U)
+
+//-------------------------------------------------------------
+// Перевод выводов в режим обычного вывода (открытый сток)
+//-------------------------------------------------------------
+void SW_I2C_Init(void)
+{
+    I2C3->CR1 &= ~I2C_CR1_PE;     // отключение модуля I2C3
+
+    SET_BIT(RCC->AHB1ENR, RCC_AHB1ENR_GPIOAEN);
+    SET_BIT(RCC->AHB1ENR, RCC_AHB1ENR_GPIOCEN);
+
+    // PA8 – выход, открытый сток, подтяжка к VDD
+    MODIFY_REG(GPIOA->MODER, GPIO_MODER_MODER8_Msk,
+               (1UL << GPIO_MODER_MODER8_Pos));
+    SET_BIT(GPIOA->OTYPER, GPIO_OTYPER_OT8_Msk);
+    MODIFY_REG(GPIOA->PUPDR, GPIO_PUPDR_PUPD8_Msk,
+               (1UL << GPIO_PUPDR_PUPD8_Pos));
+    // PC9 – выход, открытый сток, подтяжка к VDD
+    MODIFY_REG(GPIOC->MODER, GPIO_MODER_MODER9_Msk,
+               (1UL << GPIO_MODER_MODER9_Pos));
+    SET_BIT(GPIOC->OTYPER, GPIO_OTYPER_OT9_Msk);
+    MODIFY_REG(GPIOC->PUPDR, GPIO_PUPDR_PUPD9_Msk,
+               (1UL << GPIO_PUPDR_PUPD9_Pos));
+
+    SDA_HI();                     // исходное состояние шины:
+    SCL_HI();                     // обе линии отпущены
+    delay_us(SW_HALF);
+}
+
+//-------------------------------------------------------------
+// Условие START: спад на линии данных при высоком уровне
+// тактового сигнала
+//-------------------------------------------------------------
+static void sw_start(void)
+{
+    SDA_HI(); SCL_HI(); delay_us(SW_HALF);
+    SDA_LO(); delay_us(SW_HALF);
+    SCL_LO(); delay_us(SW_HALF);
+}
+
+//-------------------------------------------------------------
+// Условие STOP: фронт на линии данных при высоком уровне
+// тактового сигнала
+//-------------------------------------------------------------
+static void sw_stop(void)
+{
+    SDA_LO(); delay_us(SW_HALF);
+    SCL_HI(); delay_us(SW_HALF);
+    SDA_HI(); delay_us(SW_HALF);
+}
+
+//-------------------------------------------------------------
+// Передача байта. Возвращает 0, если ведомый подтвердил
+// приём (ACK), и 1 в противном случае (NACK)
+//-------------------------------------------------------------
+static uint8_t sw_write(uint8_t b)
+{
+    uint8_t i, nack;
+
+    for (i = 0; i < 8; i++) {     // старшим битом вперёд
+        if (b & 0x80) SDA_HI();
+        else          SDA_LO();
+        b <<= 1;
+        delay_us(SW_HALF);
+        SCL_HI(); delay_us(SW_HALF);   // данные считываются
+        SCL_LO(); delay_us(SW_HALF);   // ведомым по фронту
+    }
+    SDA_HI();                     // линия отпущена ведущим
+    delay_us(SW_HALF);
+    SCL_HI(); delay_us(SW_HALF);
+    nack = SDA_IN();              // девятый такт – ответ
+    SCL_LO(); delay_us(SW_HALF);
+    return nack;
+}
+
+//-------------------------------------------------------------
+// Приём байта. Параметр ack: 1 – подтвердить приём,
+// 0 – ответить NACK (признак последнего байта)
+//-------------------------------------------------------------
+static uint8_t sw_read(uint8_t ack)
+{
+    uint8_t i, b = 0;
+
+    SDA_HI();                     // линия отдана ведомому
+    for (i = 0; i < 8; i++) {
+        delay_us(SW_HALF);
+        SCL_HI(); delay_us(SW_HALF);
+        b = (uint8_t)((b << 1) | SDA_IN());
+        SCL_LO();
+    }
+    if (ack) SDA_LO();            // подтверждение приёма
+    else     SDA_HI();            // отказ от продолжения
+    delay_us(SW_HALF);
+    SCL_HI(); delay_us(SW_HALF);
+    SCL_LO(); delay_us(SW_HALF);
+    SDA_HI();
+    return b;
+}
+
+//-------------------------------------------------------------
+// Чтение одного байта из регистра ведомого программным
+// способом. Возвращает байт либо 0xFF при ошибке
+//-------------------------------------------------------------
+uint8_t SW_ReadByte(uint8_t dev_addr, uint8_t reg)
+{
+    uint8_t data;
+
+    sw_start();                            // старт
+    if (sw_write((uint8_t)((dev_addr << 1) & 0xFE))) {
+        sw_stop();                         // адрес (запись)
+        return 0xFF;
+    }
+    if (sw_write(reg)) {                   // номер регистра
+        sw_stop();
+        return 0xFF;
+    }
+    sw_start();                            // повторный старт
+    if (sw_write((uint8_t)((dev_addr << 1) | 0x01))) {
+        sw_stop();                         // адрес (чтение)
+        return 0xFF;
+    }
+    data = sw_read(0);          // приём байта с ответом NACK
+    sw_stop();                             // стоп
+    return data;
 }
 
 //=============================================================
