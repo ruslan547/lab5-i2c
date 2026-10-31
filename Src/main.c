@@ -77,6 +77,9 @@ void LCD_diag(uint8_t stage, uint8_t data);
 // моделируется не полностью)
 void SW_I2C_Init(void);
 uint8_t SW_ReadByte(uint8_t dev_addr, uint8_t reg);
+// параметры программной реализации (см. ниже)
+extern volatile uint8_t sw_half;
+extern volatile uint8_t sw_pp;
 
 // Номер выполняемого шага обмена. Старший бит
 // устанавливается, если на этом шаге истекло время
@@ -88,6 +91,8 @@ volatile uint8_t i2c_mode = 1;
 volatile uint8_t i2c_fail = 0;
 // Признак перехода на программную реализацию шины
 volatile uint8_t sw_used = 0;
+// Номер сработавшего сочетания параметров (0...3)
+volatile uint8_t sw_try = 0;
 
 //=============================================================
 // ОСНОВНАЯ ПРОГРАММА
@@ -116,16 +121,35 @@ int main(void)
         delay_ms(5);          // пауза на освобождение шины
         id = I2C_ReadByte(BMP180_ADDR, BMP180_CHIP_ID);
     }
-    if (id != 0x55) {     // переход на программную шину
-        SW_I2C_Init();
-        id = SW_ReadByte(BMP180_ADDR, BMP180_CHIP_ID);
+    // Переход на программную шину. Перебираются четыре
+    // сочетания: тип выхода (открытый сток либо
+    // двухтактный) и длительность половины периода
+    // (обычная либо увеличенная). Номер сработавшего
+    // сочетания выводится на индикатор
+    if (id != 0x55) {
+        static const uint8_t pp[4]   = {0, 1, 1, 0};
+        static const uint8_t half[4] = {3, 3, 25, 25};
+
+        for (sw_try = 0; sw_try < 4; sw_try++) {
+            sw_pp   = pp[sw_try];
+            sw_half = half[sw_try];
+            SW_I2C_Init();
+            id = SW_ReadByte(BMP180_ADDR, BMP180_CHIP_ID);
+            if (id == 0x55) break;
+            delay_ms(5);
+        }
         sw_used = 1;
     }
     // отображение результата на дисплее
-    if (id == 0x55)
-        LCD_send_string(sw_used ? "BMP180 OK! (S)  "
-                      : (i2c_mode ? "BMP180 OK! (B)  "
-                                  : "BMP180 OK! (A)  "));
+    if (id == 0x55) {
+        if (sw_used) {
+            char m[17] = "BMP180 OK! (S.) ";
+            m[13] = (char)('1' + sw_try);
+            LCD_send_string(m);
+        }
+        else LCD_send_string(i2c_mode ? "BMP180 OK! (B)  "
+                                      : "BMP180 OK! (A)  ");
+    }
     else
         LCD_diag(i2c_fail, id);   // шаг сбоя и принятый байт
 
@@ -168,7 +192,16 @@ void LCD_diag(uint8_t stage, uint8_t data)
 // и она подтягивается к VDD внешним резистором 4,7 кОм
 //=============================================================
 // половина периода тактового сигнала, мкс (200 кГц)
-#define SW_HALF   3
+// половина периода тактового сигнала, мкс.
+// Значение задаётся во время работы: при повышенной
+// ёмкостной нагрузке линии фронт нарастает медленнее,
+// и обмен требует замедления
+volatile uint8_t sw_half = 3;
+// Режим выходов: 0 – открытый сток (как требует стандарт
+// I2C), 1 – двухтактный. Двухтактный режим применяется
+// только при моделировании: он позволяет выдавать
+// единицу активно, не полагаясь на подтягивающий резистор
+volatile uint8_t sw_pp = 0;
 
 // управление линиями
 #define SCL_HI()  (GPIOA->BSRR = GPIO_BSRR_BS8)
@@ -177,9 +210,32 @@ void LCD_diag(uint8_t stage, uint8_t data)
 #define SDA_LO()  (GPIOC->BSRR = GPIO_BSRR_BR9)
 // чтение состояния линии данных
 #define SDA_IN()  ((GPIOC->IDR & GPIO_IDR_ID9) ? 1U : 0U)
+// половина периода тактового сигнала
+#define SW_WAIT() delay_us(sw_half)
 
 //-------------------------------------------------------------
-// Перевод выводов в режим обычного вывода (открытый сток)
+// Переключение линии данных на выход либо на вход.
+// В двухтактном режиме отпустить линию можно только
+// переводом вывода во вход, поэтому направление
+// переключается явно в обоих режимах
+//-------------------------------------------------------------
+static void sda_out(void)
+{
+    MODIFY_REG(GPIOC->MODER, GPIO_MODER_MODER9_Msk,
+               (1UL << GPIO_MODER_MODER9_Pos));
+}
+
+static void sda_free(void)
+{
+    if (sw_pp)                     // двухтактный режим:
+        MODIFY_REG(GPIOC->MODER,   // линия отпускается
+                   GPIO_MODER_MODER9_Msk, 0UL);
+    else
+        SDA_HI();                  // открытый сток
+}
+
+//-------------------------------------------------------------
+// Перевод выводов в режим обычного вывода
 //-------------------------------------------------------------
 void SW_I2C_Init(void)
 {
@@ -188,22 +244,31 @@ void SW_I2C_Init(void)
     SET_BIT(RCC->AHB1ENR, RCC_AHB1ENR_GPIOAEN);
     SET_BIT(RCC->AHB1ENR, RCC_AHB1ENR_GPIOCEN);
 
-    // PA8 – выход, открытый сток, подтяжка к VDD
+    // PA8 – выход, подтяжка к VDD
     MODIFY_REG(GPIOA->MODER, GPIO_MODER_MODER8_Msk,
                (1UL << GPIO_MODER_MODER8_Pos));
-    SET_BIT(GPIOA->OTYPER, GPIO_OTYPER_OT8_Msk);
     MODIFY_REG(GPIOA->PUPDR, GPIO_PUPDR_PUPD8_Msk,
                (1UL << GPIO_PUPDR_PUPD8_Pos));
-    // PC9 – выход, открытый сток, подтяжка к VDD
+    // PC9 – выход, подтяжка к VDD
     MODIFY_REG(GPIOC->MODER, GPIO_MODER_MODER9_Msk,
                (1UL << GPIO_MODER_MODER9_Pos));
-    SET_BIT(GPIOC->OTYPER, GPIO_OTYPER_OT9_Msk);
     MODIFY_REG(GPIOC->PUPDR, GPIO_PUPDR_PUPD9_Msk,
                (1UL << GPIO_PUPDR_PUPD9_Pos));
 
+    // тип выхода – согласно выбранному режиму
+    if (sw_pp) {                   // двухтактный
+        CLEAR_BIT(GPIOA->OTYPER, GPIO_OTYPER_OT8_Msk);
+        CLEAR_BIT(GPIOC->OTYPER, GPIO_OTYPER_OT9_Msk);
+    }
+    else {                         // открытый сток
+        SET_BIT(GPIOA->OTYPER, GPIO_OTYPER_OT8_Msk);
+        SET_BIT(GPIOC->OTYPER, GPIO_OTYPER_OT9_Msk);
+    }
+
+    sda_out();
     SDA_HI();                     // исходное состояние шины:
     SCL_HI();                     // обе линии отпущены
-    delay_us(SW_HALF);
+    SW_WAIT();
 }
 
 //-------------------------------------------------------------
@@ -212,9 +277,10 @@ void SW_I2C_Init(void)
 //-------------------------------------------------------------
 static void sw_start(void)
 {
-    SDA_HI(); SCL_HI(); delay_us(SW_HALF);
-    SDA_LO(); delay_us(SW_HALF);
-    SCL_LO(); delay_us(SW_HALF);
+    sda_out();
+    SDA_HI(); SCL_HI(); SW_WAIT();
+    SDA_LO(); SW_WAIT();
+    SCL_LO(); SW_WAIT();
 }
 
 //-------------------------------------------------------------
@@ -223,9 +289,10 @@ static void sw_start(void)
 //-------------------------------------------------------------
 static void sw_stop(void)
 {
-    SDA_LO(); delay_us(SW_HALF);
-    SCL_HI(); delay_us(SW_HALF);
-    SDA_HI(); delay_us(SW_HALF);
+    sda_out();
+    SDA_LO(); SW_WAIT();
+    SCL_HI(); SW_WAIT();
+    SDA_HI(); SW_WAIT();
 }
 
 //-------------------------------------------------------------
@@ -236,19 +303,20 @@ static uint8_t sw_write(uint8_t b)
 {
     uint8_t i, nack;
 
+    sda_out();
     for (i = 0; i < 8; i++) {     // старшим битом вперёд
         if (b & 0x80) SDA_HI();
         else          SDA_LO();
         b <<= 1;
-        delay_us(SW_HALF);
-        SCL_HI(); delay_us(SW_HALF);   // данные считываются
-        SCL_LO(); delay_us(SW_HALF);   // ведомым по фронту
+        SW_WAIT();
+        SCL_HI(); SW_WAIT();           // данные считываются
+        SCL_LO(); SW_WAIT();           // ведомым по фронту
     }
-    SDA_HI();                     // линия отпущена ведущим
-    delay_us(SW_HALF);
-    SCL_HI(); delay_us(SW_HALF);
+    sda_free();                   // линия отдана ведомому
+    SW_WAIT();
+    SCL_HI(); SW_WAIT();
     nack = SDA_IN();              // девятый такт – ответ
-    SCL_LO(); delay_us(SW_HALF);
+    SCL_LO(); SW_WAIT();
     return nack;
 }
 
@@ -260,19 +328,22 @@ static uint8_t sw_read(uint8_t ack)
 {
     uint8_t i, b = 0;
 
-    SDA_HI();                     // линия отдана ведомому
+    sda_free();                   // линия отдана ведомому
     for (i = 0; i < 8; i++) {
-        delay_us(SW_HALF);
-        SCL_HI(); delay_us(SW_HALF);
+        SW_WAIT();
+        SCL_HI(); SW_WAIT();
         b = (uint8_t)((b << 1) | SDA_IN());
         SCL_LO();
     }
-    if (ack) SDA_LO();            // подтверждение приёма
-    else     SDA_HI();            // отказ от продолжения
-    delay_us(SW_HALF);
-    SCL_HI(); delay_us(SW_HALF);
-    SCL_LO(); delay_us(SW_HALF);
-    SDA_HI();
+    if (ack) {                    // подтверждение приёма
+        sda_out();
+        SDA_LO();
+    }
+    else sda_free();              // отказ от продолжения
+    SW_WAIT();
+    SCL_HI(); SW_WAIT();
+    SCL_LO(); SW_WAIT();
+    sda_free();
     return b;
 }
 
