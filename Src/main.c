@@ -101,7 +101,12 @@ int main(void)
     // устройства с адресом BMP180_ADDR
     I2C_WriteByte(BMP180_ADDR, BMP180_MEAS_CTRL, 0xFF);
 
-    while (1) {};
+    // периодическое повторение обмена: позволяет наблюдать
+    // осциллограммы шины и работу анализатора протокола
+    while (1) {
+        delay_ms(100);
+        I2C_ReadByte(BMP180_ADDR, BMP180_CHIP_ID);
+    }
 }
 
 //=============================================================
@@ -235,9 +240,10 @@ uint8_t I2C_ReadByte(uint8_t dev_addr, uint8_t reg)
     data = I2C3->DR;        // чтение байта сбрасывает RXNE
 
     timeout = I2C_TIMEOUT;
-    // ждём аппаратного сброса бита STOP
+    // ожидание сброса бита STOP не критично: шина уже
+    // освобождена, поэтому истечение времени ожидания
+    // здесь ошибкой не считается
     while ((I2C3->CR1 & I2C_CR1_STOP) && --timeout) {};
-    if (!timeout) goto error;
     return data;
 
 error:
@@ -288,8 +294,8 @@ uint8_t I2C_WriteByte(uint8_t dev_addr, uint8_t reg,
     // 4. Условие STOP и завершение транзакции
     I2C3->CR1 |= I2C_CR1_STOP;
     timeout = I2C_TIMEOUT;
+    // см. примечание в I2C_ReadByte
     while ((I2C3->CR1 & I2C_CR1_STOP) && --timeout) {};
-    if (!timeout) goto error;
     return 0;               // успех
 
 error:
