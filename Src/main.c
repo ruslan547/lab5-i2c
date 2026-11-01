@@ -387,24 +387,38 @@ static void I2C3_Recover(void)
 //=============================================================
 // ПРОГРАММНАЯ РЕАЛИЗАЦИЯ ШИНЫ I2C (PA8 – SCL, PC9 – SDA)
 //-------------------------------------------------------------
-// Выводы – выходы с открытым стоком: запись 0 прижимает
-// линию к общему проводу, запись 1 отпускает её, и линия
-// подтягивается к +3,3 В резисторами R1, R2. Состояние SDA
-// читается через IDR при отпущенной линии.
+// Линии управляются по принципу открытого стока: в ODR
+// записан 0, и уровень 0 формируется переводом вывода
+// в режим выхода, а уровень 1 – переводом во вход
+// (линия отпускается и подтягивается к +3,3 В
+// резисторами R1, R2). Состояние линий читается через IDR.
 // Частота шины F_SCL = 200 кГц: каждый бит – два
 // полупериода по 2,5 мкс (низкий и высокий уровень SCL)
 //=============================================================
 // тактов ядра на один проход цикла sw_wait() (-O0)
 #define SW_LOOP_CYCLES    10UL
+// предельное время удержания SCL ведомым, проходов цикла
+#define SW_STRETCH_MAX    1000UL
 
-#define SCL_H()   (GPIOA->BSRR = GPIO_BSRR_BS8)
-#define SCL_L()   (GPIOA->BSRR = GPIO_BSRR_BR8)
-#define SDA_H()   (GPIOC->BSRR = GPIO_BSRR_BS9)
-#define SDA_L()   (GPIOC->BSRR = GPIO_BSRR_BR9)
+#define SCL_L()   SET_BIT(GPIOA->MODER, GPIO_MODER_MODER8_0)
+#define SCL_REL() CLEAR_BIT(GPIOA->MODER, GPIO_MODER_MODER8_Msk)
+#define SDA_L()   SET_BIT(GPIOC->MODER, GPIO_MODER_MODER9_0)
+#define SDA_H()   CLEAR_BIT(GPIOC->MODER, GPIO_MODER_MODER9_Msk)
+#define SCL_READ() ((GPIOA->IDR & GPIO_IDR_ID8) ? 1U : 0U)
 #define SDA_READ() ((GPIOC->IDR & GPIO_IDR_ID9) ? 1U : 0U)
 
 // число проходов цикла задержки на полупериод SCL
 static uint32_t sw_ticks = 1;
+
+// отпускание SCL и ожидание его фактического подъёма:
+// ведомый вправе удерживать SCL (clock stretching)
+static void SCL_H(void)
+{
+    uint32_t t = SW_STRETCH_MAX;
+
+    SCL_REL();
+    while (!SCL_READ() && --t) {};
+}
 
 // задержка на полупериод SCL (2,5 мкс при 200 кГц)
 static void sw_wait(void)
@@ -423,16 +437,15 @@ void SW_I2C_Init(void)
     SET_BIT(RCC->AHB1ENR, RCC_AHB1ENR_GPIOAEN);
     SET_BIT(RCC->AHB1ENR, RCC_AHB1ENR_GPIOCEN);
 
-    SCL_H();                      // исходно линии отпущены
+    // исходно обе линии отпущены: выводы – входы
+    // без внутренней подтяжки (подтяжка внешняя)
+    SCL_REL();
     SDA_H();
-    // PA8 – выход (01), открытый сток
-    MODIFY_REG(GPIOA->MODER, GPIO_MODER_MODER8_Msk,
-               (1UL << GPIO_MODER_MODER8_Pos));
-    SET_BIT(GPIOA->OTYPER, GPIO_OTYPER_OT8_Msk);
-    // PC9 – выход (01), открытый сток
-    MODIFY_REG(GPIOC->MODER, GPIO_MODER_MODER9_Msk,
-               (1UL << GPIO_MODER_MODER9_Pos));
-    SET_BIT(GPIOC->OTYPER, GPIO_OTYPER_OT9_Msk);
+    CLEAR_BIT(GPIOA->PUPDR, GPIO_PUPDR_PUPD8_Msk);
+    CLEAR_BIT(GPIOC->PUPDR, GPIO_PUPDR_PUPD9_Msk);
+    // в режиме выхода вывод выдаёт только 0
+    GPIOA->BSRR = GPIO_BSRR_BR8;
+    GPIOC->BSRR = GPIO_BSRR_BR9;
 
     // полупериод в тактах ядра: 84 МГц / (2 * 200 кГц) = 210
     sw_ticks = SystemCoreClock / (2UL * F_SCL) / SW_LOOP_CYCLES;
