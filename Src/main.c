@@ -448,8 +448,8 @@ void SW_I2C_Init(void)
     GPIOC->BSRR = GPIO_BSRR_BR9;
 
     // полупериод в тактах ядра: 84 МГц / (2 * 200 кГц) = 210
+    // (значение уточнено по осциллограмме в Proteus)
     sw_ticks = SystemCoreClock / (2UL * F_SCL) / SW_LOOP_CYCLES;
-    if (sw_ticks > 1UL) sw_ticks--;   // учёт смены уровней
     sw_wait();
 }
 
