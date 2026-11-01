@@ -70,36 +70,15 @@ uint8_t I2C_ReadByte(uint8_t dev_addr, uint8_t reg);
 // Запись одного байта в регистр ведомого
 uint8_t I2C_WriteByte(uint8_t dev_addr, uint8_t reg,
                       uint8_t value);
-// Вывод диагностики: номер шага и принятый байт
-void LCD_diag(uint8_t stage, uint8_t data);
-// Резервная программная реализация шины на тех же
-// выводах (применяется, если аппаратный модуль
-// моделируется не полностью)
-void SW_I2C_Init(void);
-uint8_t SW_ReadByte(uint8_t dev_addr, uint8_t reg);
-// параметры программной реализации (см. ниже)
-extern volatile uint8_t sw_half;
-extern volatile uint8_t sw_pp;
-
-// Номер выполняемого шага обмена. Старший бит
-// устанавливается, если на этом шаге истекло время
-// ожидания. Значение видно в окне переменных отладчика
-volatile uint8_t i2c_stage = 0;
-// Вариант завершения приёма: 0 – А, 1 – Б (см. ниже)
-volatile uint8_t i2c_mode = 1;
-// Код первого зафиксированного сбоя
-volatile uint8_t i2c_fail = 0;
-// Признак перехода на программную реализацию шины
-volatile uint8_t sw_used = 0;
-// Номер сработавшего сочетания параметров (0...3)
-volatile uint8_t sw_try = 0;
+// Освобождение шины и сброс модуля после сбоя
+static void I2C3_Recover(void);
 
 //=============================================================
 // ОСНОВНАЯ ПРОГРАММА
 //=============================================================
 int main(void)
 {
-    // инициализация тактирования (HSI, 84 МГц)
+    // инициализация тактирования (HSI -> PLL, 84 МГц)
     RCC_HSI_init();
 
     LCD_port_init();              // инициализация порта ЖКИ
@@ -116,262 +95,15 @@ int main(void)
     // чтение байта из регистра BMP180_CHIP_ID устройства
     // с адресом BMP180_ADDR
     id = I2C_ReadByte(BMP180_ADDR, BMP180_CHIP_ID);
-    if (id != 0x55) {         // повтор по второму варианту
-        i2c_mode = (uint8_t)(i2c_mode ? 0 : 1);
-        delay_ms(5);          // пауза на освобождение шины
-        id = I2C_ReadByte(BMP180_ADDR, BMP180_CHIP_ID);
-    }
-    // Переход на программную шину. Перебираются четыре
-    // сочетания: тип выхода (открытый сток либо
-    // двухтактный) и длительность половины периода
-    // (обычная либо увеличенная). Номер сработавшего
-    // сочетания выводится на индикатор
-    if (id != 0x55) {
-        static const uint8_t pp[4]   = {0, 1, 1, 0};
-        static const uint8_t half[4] = {3, 3, 25, 25};
-
-        for (sw_try = 0; sw_try < 4; sw_try++) {
-            sw_pp   = pp[sw_try];
-            sw_half = half[sw_try];
-            SW_I2C_Init();
-            id = SW_ReadByte(BMP180_ADDR, BMP180_CHIP_ID);
-            if (id == 0x55) break;
-            delay_ms(5);
-        }
-        sw_used = 1;
-    }
     // отображение результата на дисплее
-    if (id == 0x55) {
-        if (sw_used) {
-            char m[17] = "BMP180 OK! (S.) ";
-            m[13] = (char)('1' + sw_try);
-            LCD_send_string(m);
-        }
-        else LCD_send_string(i2c_mode ? "BMP180 OK! (B)  "
-                                      : "BMP180 OK! (A)  ");
-    }
-    else
-        LCD_diag(i2c_fail, id);   // шаг сбоя и принятый байт
+    if (id == 0x55) LCD_send_string("BMP180 OK!");
+    else            LCD_send_string("BMP180 FAIL!");
 
     // запись байта 0xFF в регистр BMP180_MEAS_CTRL
     // устройства с адресом BMP180_ADDR
-    if (!sw_used)
-        I2C_WriteByte(BMP180_ADDR, BMP180_MEAS_CTRL, 0xFF);
+    I2C_WriteByte(BMP180_ADDR, BMP180_MEAS_CTRL, 0xFF);
 
-    // периодическое повторение обмена: позволяет наблюдать
-    // осциллограммы шины и работу анализатора протокола
-    while (1) {
-        delay_ms(100);
-        if (sw_used) SW_ReadByte(BMP180_ADDR, BMP180_CHIP_ID);
-        else I2C_ReadByte(BMP180_ADDR, BMP180_CHIP_ID);
-    }
-}
-
-//=============================================================
-// Вывод диагностики в формате "ST=xx D=xx": номер шага,
-// на котором прервался обмен, и последний принятый байт
-//=============================================================
-void LCD_diag(uint8_t stage, uint8_t data)
-{
-    static const char h[] = "0123456789ABCDEF";
-    char s[17] = "ST=..  D=..     ";
-
-    s[3] = h[(stage >> 4) & 0x0F];
-    s[4] = h[stage & 0x0F];
-    s[9] = h[(data >> 4) & 0x0F];
-    s[10] = h[data & 0x0F];
-    LCD_send_string(s);
-}
-
-//=============================================================
-// РЕЗЕРВНАЯ ПРОГРАММНАЯ РЕАЛИЗАЦИЯ ШИНЫ I2C
-//-------------------------------------------------------------
-// Используется при неполной поддержке аппаратного модуля
-// средой моделирования. Выводы те же: PA8 – SCL, PC9 – SDA,
-// режим «выход с открытым стоком»: запись 1 отпускает линию,
-// и она подтягивается к VDD внешним резистором 4,7 кОм
-//=============================================================
-// половина периода тактового сигнала, мкс (200 кГц)
-// половина периода тактового сигнала, мкс.
-// Значение задаётся во время работы: при повышенной
-// ёмкостной нагрузке линии фронт нарастает медленнее,
-// и обмен требует замедления
-volatile uint8_t sw_half = 3;
-// Режим выходов: 0 – открытый сток (как требует стандарт
-// I2C), 1 – двухтактный. Двухтактный режим применяется
-// только при моделировании: он позволяет выдавать
-// единицу активно, не полагаясь на подтягивающий резистор
-volatile uint8_t sw_pp = 0;
-
-// управление линиями
-#define SCL_HI()  (GPIOA->BSRR = GPIO_BSRR_BS8)
-#define SCL_LO()  (GPIOA->BSRR = GPIO_BSRR_BR8)
-#define SDA_HI()  (GPIOC->BSRR = GPIO_BSRR_BS9)
-#define SDA_LO()  (GPIOC->BSRR = GPIO_BSRR_BR9)
-// чтение состояния линии данных
-#define SDA_IN()  ((GPIOC->IDR & GPIO_IDR_ID9) ? 1U : 0U)
-// половина периода тактового сигнала
-#define SW_WAIT() delay_us(sw_half)
-
-//-------------------------------------------------------------
-// Переключение линии данных на выход либо на вход.
-// В двухтактном режиме отпустить линию можно только
-// переводом вывода во вход, поэтому направление
-// переключается явно в обоих режимах
-//-------------------------------------------------------------
-static void sda_out(void)
-{
-    MODIFY_REG(GPIOC->MODER, GPIO_MODER_MODER9_Msk,
-               (1UL << GPIO_MODER_MODER9_Pos));
-}
-
-static void sda_free(void)
-{
-    if (sw_pp)                     // двухтактный режим:
-        MODIFY_REG(GPIOC->MODER,   // линия отпускается
-                   GPIO_MODER_MODER9_Msk, 0UL);
-    else
-        SDA_HI();                  // открытый сток
-}
-
-//-------------------------------------------------------------
-// Перевод выводов в режим обычного вывода
-//-------------------------------------------------------------
-void SW_I2C_Init(void)
-{
-    I2C3->CR1 &= ~I2C_CR1_PE;     // отключение модуля I2C3
-
-    SET_BIT(RCC->AHB1ENR, RCC_AHB1ENR_GPIOAEN);
-    SET_BIT(RCC->AHB1ENR, RCC_AHB1ENR_GPIOCEN);
-
-    // PA8 – выход, подтяжка к VDD
-    MODIFY_REG(GPIOA->MODER, GPIO_MODER_MODER8_Msk,
-               (1UL << GPIO_MODER_MODER8_Pos));
-    MODIFY_REG(GPIOA->PUPDR, GPIO_PUPDR_PUPD8_Msk,
-               (1UL << GPIO_PUPDR_PUPD8_Pos));
-    // PC9 – выход, подтяжка к VDD
-    MODIFY_REG(GPIOC->MODER, GPIO_MODER_MODER9_Msk,
-               (1UL << GPIO_MODER_MODER9_Pos));
-    MODIFY_REG(GPIOC->PUPDR, GPIO_PUPDR_PUPD9_Msk,
-               (1UL << GPIO_PUPDR_PUPD9_Pos));
-
-    // тип выхода – согласно выбранному режиму
-    if (sw_pp) {                   // двухтактный
-        CLEAR_BIT(GPIOA->OTYPER, GPIO_OTYPER_OT8_Msk);
-        CLEAR_BIT(GPIOC->OTYPER, GPIO_OTYPER_OT9_Msk);
-    }
-    else {                         // открытый сток
-        SET_BIT(GPIOA->OTYPER, GPIO_OTYPER_OT8_Msk);
-        SET_BIT(GPIOC->OTYPER, GPIO_OTYPER_OT9_Msk);
-    }
-
-    sda_out();
-    SDA_HI();                     // исходное состояние шины:
-    SCL_HI();                     // обе линии отпущены
-    SW_WAIT();
-}
-
-//-------------------------------------------------------------
-// Условие START: спад на линии данных при высоком уровне
-// тактового сигнала
-//-------------------------------------------------------------
-static void sw_start(void)
-{
-    sda_out();
-    SDA_HI(); SCL_HI(); SW_WAIT();
-    SDA_LO(); SW_WAIT();
-    SCL_LO(); SW_WAIT();
-}
-
-//-------------------------------------------------------------
-// Условие STOP: фронт на линии данных при высоком уровне
-// тактового сигнала
-//-------------------------------------------------------------
-static void sw_stop(void)
-{
-    sda_out();
-    SDA_LO(); SW_WAIT();
-    SCL_HI(); SW_WAIT();
-    SDA_HI(); SW_WAIT();
-}
-
-//-------------------------------------------------------------
-// Передача байта. Возвращает 0, если ведомый подтвердил
-// приём (ACK), и 1 в противном случае (NACK)
-//-------------------------------------------------------------
-static uint8_t sw_write(uint8_t b)
-{
-    uint8_t i, nack;
-
-    sda_out();
-    for (i = 0; i < 8; i++) {     // старшим битом вперёд
-        if (b & 0x80) SDA_HI();
-        else          SDA_LO();
-        b <<= 1;
-        SW_WAIT();
-        SCL_HI(); SW_WAIT();           // данные считываются
-        SCL_LO(); SW_WAIT();           // ведомым по фронту
-    }
-    sda_free();                   // линия отдана ведомому
-    SW_WAIT();
-    SCL_HI(); SW_WAIT();
-    nack = SDA_IN();              // девятый такт – ответ
-    SCL_LO(); SW_WAIT();
-    return nack;
-}
-
-//-------------------------------------------------------------
-// Приём байта. Параметр ack: 1 – подтвердить приём,
-// 0 – ответить NACK (признак последнего байта)
-//-------------------------------------------------------------
-static uint8_t sw_read(uint8_t ack)
-{
-    uint8_t i, b = 0;
-
-    sda_free();                   // линия отдана ведомому
-    for (i = 0; i < 8; i++) {
-        SW_WAIT();
-        SCL_HI(); SW_WAIT();
-        b = (uint8_t)((b << 1) | SDA_IN());
-        SCL_LO();
-    }
-    if (ack) {                    // подтверждение приёма
-        sda_out();
-        SDA_LO();
-    }
-    else sda_free();              // отказ от продолжения
-    SW_WAIT();
-    SCL_HI(); SW_WAIT();
-    SCL_LO(); SW_WAIT();
-    sda_free();
-    return b;
-}
-
-//-------------------------------------------------------------
-// Чтение одного байта из регистра ведомого программным
-// способом. Возвращает байт либо 0xFF при ошибке
-//-------------------------------------------------------------
-uint8_t SW_ReadByte(uint8_t dev_addr, uint8_t reg)
-{
-    uint8_t data;
-
-    sw_start();                            // старт
-    if (sw_write((uint8_t)((dev_addr << 1) & 0xFE))) {
-        sw_stop();                         // адрес (запись)
-        return 0xFF;
-    }
-    if (sw_write(reg)) {                   // номер регистра
-        sw_stop();
-        return 0xFF;
-    }
-    sw_start();                            // повторный старт
-    if (sw_write((uint8_t)((dev_addr << 1) | 0x01))) {
-        sw_stop();                         // адрес (чтение)
-        return 0xFF;
-    }
-    data = sw_read(0);          // приём байта с ответом NACK
-    sw_stop();                             // стоп
-    return data;
+    while (1) {};
 }
 
 //=============================================================
@@ -436,29 +168,26 @@ void I2C3_Init(void)
 
     I2C3->TRISE = trise;   // время нарастания фронта
     I2C3->CR1 |= I2C_CR1_PE;  // включение модуля
-    return;
 }
 
 //=============================================================
-// Чтение одного байта из регистра ведомого
-// (режим Master Receiver, 1 байт).
+// Чтение одного байта из регистра ведомого:
+// S – адрес+W – номер регистра – Sr – адрес+R – байт – NACK – P
+// (режим Master Receiver, 1 байт, RM0368 п. 18.3.3).
 // Возвращает: прочитанный байт либо 0xFF при ошибке
 //=============================================================
 uint8_t I2C_ReadByte(uint8_t dev_addr, uint8_t reg)
 {
-    uint8_t data = 0;      // прочитанный байт
+    uint8_t data;          // прочитанный байт
     // максимальное время ожидания, циклов
     uint32_t timeout = I2C_TIMEOUT;
 
-    i2c_stage = 0x01;
     // ждём, пока флаг BUSY не станет 0 (шина свободна)
     while ((I2C3->SR2 & I2C_SR2_BUSY) && --timeout) {};
     if (!timeout) goto error;   // шина зависла
 
-    //--- Сеанс 1: установка указателя регистра ---------
     // 1. START + адрес устройства (Write)
     I2C3->CR1 |= I2C_CR1_START;
-    i2c_stage = 0x02;
     timeout = I2C_TIMEOUT;
     // ждём флаг SB (Start Bit)
     while (!(I2C3->SR1 & I2C_SR1_SB) && --timeout) {};
@@ -467,7 +196,6 @@ uint8_t I2C_ReadByte(uint8_t dev_addr, uint8_t reg)
     // 7-битный адрес + бит 0 (Write);
     // 0xFE = 11111110 – обнуление бита R/W
     I2C3->DR = (dev_addr << 1) & 0xFE;
-    i2c_stage = 0x03;
     timeout = I2C_TIMEOUT;
     // ждём подтверждения адреса (ACK от ведомого)
     while (!(I2C3->SR1 & I2C_SR1_ADDR) && --timeout) {};
@@ -479,84 +207,51 @@ uint8_t I2C_ReadByte(uint8_t dev_addr, uint8_t reg)
 
     // 2. Отправка номера регистра (sub-address)
     I2C3->DR = reg;
-    i2c_stage = 0x04;
     timeout = I2C_TIMEOUT;
-    // ждём BTF: передача байта полностью завершена
+    // ждём BTF: байт передан, сдвиговый регистр пуст –
+    // здесь безопасен повторный старт
     while (!(I2C3->SR1 & I2C_SR1_BTF) && --timeout) {};
     if (!timeout) goto error;
 
-    // 3. STOP – указатель регистра установлен
-    I2C3->CR1 |= I2C_CR1_STOP;
-    timeout = I2C_TIMEOUT;
-    while ((I2C3->CR1 & I2C_CR1_STOP) && --timeout) {};
-    delay_us(10);          // пауза между сеансами связи
-
-    //--- Сеанс 2: чтение данных ------------------------
-    // 4. START + адрес устройства (Read)
+    // 3. Repeated Start (без STOP) + адрес устройства (Read)
     I2C3->CR1 |= I2C_CR1_START;
-    i2c_stage = 0x05;
     timeout = I2C_TIMEOUT;
     while (!(I2C3->SR1 & I2C_SR1_SB) && --timeout) {};
     if (!timeout) goto error;
 
     I2C3->DR = (dev_addr << 1) | 0x01;  // адрес + бит Read
-    i2c_stage = 0x06;
     timeout = I2C_TIMEOUT;
     while (!(I2C3->SR1 & I2C_SR1_ADDR) && --timeout) {};
     if (!timeout) goto error;
 
-    // 5. Приём одного байта. Применяется один из двух
-    // допустимых порядков завершения обмена
-    if (i2c_mode == 0) {
-        // А: по документации – ACK снимается до снятия
-        // ADDR, условие STOP выдаётся до чтения DR
-        I2C3->CR1 &= ~I2C_CR1_ACK;
-        (void)I2C3->SR1;
-        (void)I2C3->SR2;
-        I2C3->CR1 |= I2C_CR1_STOP;
-    }
-    else {
-        // Б: приём при установленном бите ACK, снятие
-        // ACK и STOP – после появления принятого байта
-        I2C3->CR1 |= I2C_CR1_ACK;
-        (void)I2C3->SR1;
-        (void)I2C3->SR2;
-    }
+    // 4. Приём одного байта: ACK снимается ДО сброса ADDR,
+    // чтобы после байта ведущий выдал NACK, затем
+    // сразу задаётся STOP
+    I2C3->CR1 &= ~I2C_CR1_ACK;
+    (void)I2C3->SR1;        // сброс флага ADDR
+    (void)I2C3->SR2;
+    I2C3->CR1 |= I2C_CR1_STOP;
 
-    i2c_stage = 0x07;
     timeout = I2C_TIMEOUT;
     // ждём, пока в DR появится принятый байт
-    while (!(I2C3->SR1 & (I2C_SR1_RXNE | I2C_SR1_BTF))
-           && --timeout) {};
+    while (!(I2C3->SR1 & I2C_SR1_RXNE) && --timeout) {};
     if (!timeout) goto error;
-    if (i2c_mode != 0) {
-        I2C3->CR1 &= ~I2C_CR1_ACK;
-        I2C3->CR1 |= I2C_CR1_STOP;
-    }
     data = I2C3->DR;        // чтение байта сбрасывает RXNE
 
+    // ждём завершения условия STOP на шине
     timeout = I2C_TIMEOUT;
-    // ожидание сброса бита STOP не критично: шина уже
-    // освобождена, поэтому истечение времени ожидания
-    // здесь ошибкой не считается
     while ((I2C3->CR1 & I2C_CR1_STOP) && --timeout) {};
+    I2C3->CR1 |= I2C_CR1_ACK;   // восстановление ACK
     return data;
 
 error:
-    i2c_stage |= 0x80;          // признак сбоя на шаге
-    if (!i2c_fail)              // запоминаем первый сбой
-        i2c_fail = i2c_stage;
-    I2C3->CR1 |= I2C_CR1_STOP;  // освобождение шины
-    // даём условию STOP выйти на шину до сброса модуля,
-    // иначе линии останутся захваченными
-    timeout = I2C_TIMEOUT;
-    while ((I2C3->CR1 & I2C_CR1_STOP) && --timeout) {};
-    I2C3_Init();   // сброс модуля: снимает признак BUSY
-    return 0xFF;                // код ошибки
+    I2C3_Recover();
+    return 0xFF;            // код ошибки
 }
 
 //=============================================================
-// Запись одного байта в регистр ведомого
+// Запись одного байта в регистр ведомого:
+// S – адрес+W – номер регистра – значение – P
 // (режим Master Transmitter).
 // Возвращает: 0 при успехе, 0xFF при ошибке
 //=============================================================
@@ -564,7 +259,6 @@ uint8_t I2C_WriteByte(uint8_t dev_addr, uint8_t reg,
                       uint8_t value)
 {
     uint32_t timeout = I2C_TIMEOUT;
-    i2c_stage = 0x11;
     // ждём освобождения шины
     while ((I2C3->SR2 & I2C_SR2_BUSY) && --timeout) {};
     if (!timeout) goto error;
@@ -572,26 +266,22 @@ uint8_t I2C_WriteByte(uint8_t dev_addr, uint8_t reg,
     // 1. START + адрес устройства (Write)
     I2C3->CR1 |= I2C_CR1_START;
     timeout = I2C_TIMEOUT;
-    i2c_stage = 0x12;
     while (!(I2C3->SR1 & I2C_SR1_SB) && --timeout) {};
     if (!timeout) goto error;
 
     I2C3->DR = (dev_addr << 1) & 0xFE;
-    i2c_stage = 0x13;
     timeout = I2C_TIMEOUT;
     while (!(I2C3->SR1 & I2C_SR1_ADDR) && --timeout) {};
     if (!timeout) goto error;
     (void)I2C3->SR1;        // сброс флага ADDR:
     (void)I2C3->SR2;        // чтение SR1, затем SR2
 
-    i2c_stage = 0x14;
     // 2. Отправка номера регистра
     I2C3->DR = reg;
     timeout = I2C_TIMEOUT;
-    while (!(I2C3->SR1 & I2C_SR1_BTF) && --timeout) {};
+    while (!(I2C3->SR1 & I2C_SR1_TXE) && --timeout) {};
     if (!timeout) goto error;
 
-    i2c_stage = 0x15;
     // 3. Отправка записываемого значения
     I2C3->DR = value;
     timeout = I2C_TIMEOUT;
@@ -602,19 +292,24 @@ uint8_t I2C_WriteByte(uint8_t dev_addr, uint8_t reg,
     // 4. Условие STOP и завершение транзакции
     I2C3->CR1 |= I2C_CR1_STOP;
     timeout = I2C_TIMEOUT;
-    // см. примечание в I2C_ReadByte
     while ((I2C3->CR1 & I2C_CR1_STOP) && --timeout) {};
     return 0;               // успех
 
 error:
-    i2c_stage |= 0x80;          // признак сбоя на шаге
-    if (!i2c_fail)              // запоминаем первый сбой
-        i2c_fail = i2c_stage;
-    I2C3->CR1 |= I2C_CR1_STOP;  // освобождение шины
-    // даём условию STOP выйти на шину до сброса модуля,
-    // иначе линии останутся захваченными
-    timeout = I2C_TIMEOUT;
+    I2C3_Recover();
+    return 0xFF;            // код ошибки
+}
+
+//=============================================================
+// Освобождение шины после сбоя: условие STOP, затем
+// повторная инициализация модуля (снимает признак BUSY)
+//=============================================================
+static void I2C3_Recover(void)
+{
+    uint32_t timeout = I2C_TIMEOUT;
+
+    I2C3->CR1 |= I2C_CR1_STOP;
+    // даём условию STOP выйти на шину до сброса модуля
     while ((I2C3->CR1 & I2C_CR1_STOP) && --timeout) {};
-    I2C3_Init();   // сброс модуля: снимает признак BUSY
-    return 0xFF;                // код ошибки
+    I2C3_Init();
 }
