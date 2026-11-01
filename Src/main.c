@@ -72,6 +72,13 @@ uint8_t I2C_WriteByte(uint8_t dev_addr, uint8_t reg,
                       uint8_t value);
 // Освобождение шины и сброс модуля после сбоя
 static void I2C3_Recover(void);
+// Вывод результата чтения идентификатора на ЖКИ
+static void LCD_result(uint8_t id);
+
+// Номер шага обмена, на котором истекло время ожидания:
+// 1 – BUSY, 2 – SB, 3 – ADDR (W), 4 – BTF, 5 – SB (Sr),
+// 6 – ADDR (R), 7 – RXNE; при записи – 11...15
+volatile uint8_t i2c_step = 0;
 
 //=============================================================
 // ОСНОВНАЯ ПРОГРАММА
@@ -95,15 +102,40 @@ int main(void)
     // чтение байта из регистра BMP180_CHIP_ID устройства
     // с адресом BMP180_ADDR
     id = I2C_ReadByte(BMP180_ADDR, BMP180_CHIP_ID);
-    // отображение результата на дисплее
-    if (id == 0x55) LCD_send_string("BMP180 OK!");
-    else            LCD_send_string("BMP180 FAIL!");
+    LCD_result(id);         // отображение результата
 
     // запись байта 0xFF в регистр BMP180_MEAS_CTRL
     // устройства с адресом BMP180_ADDR
     I2C_WriteByte(BMP180_ADDR, BMP180_MEAS_CTRL, 0xFF);
 
-    while (1) {};
+    // периодическое повторение чтения: обмен попадает
+    // в окно осциллографа и отладчика I2C в любой момент
+    while (1) {
+        delay_ms(100);
+        id = I2C_ReadByte(BMP180_ADDR, BMP180_CHIP_ID);
+        LCD_pos(2, 1);
+        LCD_result(id);
+    }
+}
+
+//=============================================================
+// Вывод "BMP180 OK!" либо "FAIL ST=n D=xx": шаг сбоя
+// и принятый байт (в шестнадцатеричном виде)
+//=============================================================
+static void LCD_result(uint8_t id)
+{
+    static const char h[] = "0123456789ABCDEF";
+    char s[17] = "FAIL ST=.. D=.. ";
+
+    if (id == 0x55) {
+        LCD_send_string("BMP180 OK!      ");
+        return;
+    }
+    s[8]  = (char)('0' + i2c_step / 10);
+    s[9]  = (char)('0' + i2c_step % 10);
+    s[13] = h[id >> 4];
+    s[14] = h[id & 0x0F];
+    LCD_send_string(s);
 }
 
 //=============================================================
@@ -183,6 +215,7 @@ uint8_t I2C_ReadByte(uint8_t dev_addr, uint8_t reg)
     uint32_t timeout = I2C_TIMEOUT;
 
     // ждём, пока флаг BUSY не станет 0 (шина свободна)
+    i2c_step = 1;
     while ((I2C3->SR2 & I2C_SR2_BUSY) && --timeout) {};
     if (!timeout) goto error;   // шина зависла
 
@@ -190,6 +223,7 @@ uint8_t I2C_ReadByte(uint8_t dev_addr, uint8_t reg)
     I2C3->CR1 |= I2C_CR1_START;
     timeout = I2C_TIMEOUT;
     // ждём флаг SB (Start Bit)
+    i2c_step = 2;
     while (!(I2C3->SR1 & I2C_SR1_SB) && --timeout) {};
     if (!timeout) goto error;
 
@@ -198,6 +232,7 @@ uint8_t I2C_ReadByte(uint8_t dev_addr, uint8_t reg)
     I2C3->DR = (dev_addr << 1) & 0xFE;
     timeout = I2C_TIMEOUT;
     // ждём подтверждения адреса (ACK от ведомого)
+    i2c_step = 3;
     while (!(I2C3->SR1 & I2C_SR1_ADDR) && --timeout) {};
     if (!timeout) goto error;
     // ОБЯЗАТЕЛЬНО: чтение SR1, а затем SR2 сбрасывает
@@ -210,17 +245,20 @@ uint8_t I2C_ReadByte(uint8_t dev_addr, uint8_t reg)
     timeout = I2C_TIMEOUT;
     // ждём BTF: байт передан, сдвиговый регистр пуст –
     // здесь безопасен повторный старт
+    i2c_step = 4;
     while (!(I2C3->SR1 & I2C_SR1_BTF) && --timeout) {};
     if (!timeout) goto error;
 
     // 3. Repeated Start (без STOP) + адрес устройства (Read)
     I2C3->CR1 |= I2C_CR1_START;
     timeout = I2C_TIMEOUT;
+    i2c_step = 5;
     while (!(I2C3->SR1 & I2C_SR1_SB) && --timeout) {};
     if (!timeout) goto error;
 
     I2C3->DR = (dev_addr << 1) | 0x01;  // адрес + бит Read
     timeout = I2C_TIMEOUT;
+    i2c_step = 6;
     while (!(I2C3->SR1 & I2C_SR1_ADDR) && --timeout) {};
     if (!timeout) goto error;
 
@@ -234,6 +272,7 @@ uint8_t I2C_ReadByte(uint8_t dev_addr, uint8_t reg)
 
     timeout = I2C_TIMEOUT;
     // ждём, пока в DR появится принятый байт
+    i2c_step = 7;
     while (!(I2C3->SR1 & I2C_SR1_RXNE) && --timeout) {};
     if (!timeout) goto error;
     data = I2C3->DR;        // чтение байта сбрасывает RXNE
@@ -242,6 +281,7 @@ uint8_t I2C_ReadByte(uint8_t dev_addr, uint8_t reg)
     timeout = I2C_TIMEOUT;
     while ((I2C3->CR1 & I2C_CR1_STOP) && --timeout) {};
     I2C3->CR1 |= I2C_CR1_ACK;   // восстановление ACK
+    i2c_step = 0;           // обмен завершён успешно
     return data;
 
 error:
@@ -260,17 +300,20 @@ uint8_t I2C_WriteByte(uint8_t dev_addr, uint8_t reg,
 {
     uint32_t timeout = I2C_TIMEOUT;
     // ждём освобождения шины
+    i2c_step = 11;
     while ((I2C3->SR2 & I2C_SR2_BUSY) && --timeout) {};
     if (!timeout) goto error;
 
     // 1. START + адрес устройства (Write)
     I2C3->CR1 |= I2C_CR1_START;
     timeout = I2C_TIMEOUT;
+    i2c_step = 12;
     while (!(I2C3->SR1 & I2C_SR1_SB) && --timeout) {};
     if (!timeout) goto error;
 
     I2C3->DR = (dev_addr << 1) & 0xFE;
     timeout = I2C_TIMEOUT;
+    i2c_step = 13;
     while (!(I2C3->SR1 & I2C_SR1_ADDR) && --timeout) {};
     if (!timeout) goto error;
     (void)I2C3->SR1;        // сброс флага ADDR:
@@ -279,6 +322,7 @@ uint8_t I2C_WriteByte(uint8_t dev_addr, uint8_t reg,
     // 2. Отправка номера регистра
     I2C3->DR = reg;
     timeout = I2C_TIMEOUT;
+    i2c_step = 14;
     while (!(I2C3->SR1 & I2C_SR1_TXE) && --timeout) {};
     if (!timeout) goto error;
 
@@ -286,6 +330,7 @@ uint8_t I2C_WriteByte(uint8_t dev_addr, uint8_t reg,
     I2C3->DR = value;
     timeout = I2C_TIMEOUT;
     // ждём, пока последний байт уйдёт по шине
+    i2c_step = 15;
     while (!(I2C3->SR1 & I2C_SR1_BTF) && --timeout) {};
     if (!timeout) goto error;
 
@@ -293,6 +338,7 @@ uint8_t I2C_WriteByte(uint8_t dev_addr, uint8_t reg,
     I2C3->CR1 |= I2C_CR1_STOP;
     timeout = I2C_TIMEOUT;
     while ((I2C3->CR1 & I2C_CR1_STOP) && --timeout) {};
+    i2c_step = 0;
     return 0;               // успех
 
 error:
